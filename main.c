@@ -1,105 +1,22 @@
-/* ----------------------------------------------------------------------------
- *         SAM Software Package License
- * ----------------------------------------------------------------------------
- * Copyright (c) 2016, Atmel Corporation
- *
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * - Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the disclaimer below.
- *
- * Atmel's name may not be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * DISCLAIMER: THIS SOFTWARE IS PROVIDED BY ATMEL "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT ARE
- * DISCLAIMED. IN NO EVENT SHALL ATMEL BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA,
- * OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
- * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
- * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
- * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- * ----------------------------------------------------------------------------
- */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-/**
- *  \page lcd LCD Example
- *
- *  \section Purpose
- *
- *  This example demonstrates how to configure the LCD Controller (LCDC)
- *  to use the LCD on the board.
- *
- *  \section Requirements
- *
- *  This package can be used with SAMA5D4x Xplained board.
- *
- *  \section Description
- *
- *  The example configures the LCDC for LCD to display and then draw test
- *  patterns on LCD.
- *
- *  4 layers are displayed:
- *  - Base: The layer at bottom, show test pattern with color blocks.
- *  - OVR1: The layer over base, used as canvas to draw shapes.
- *  - HEO:  The next layer, showed scaled ('F') which flips or rotates once
- *          for a while.
- *
- *  \section Usage
- *
- *  -# Build the program and download it inside the evaluation board. Please
- *     refer to the
- *     <a href="http://www.atmel.com/dyn/resources/prod_documents/6421B.pdf">
- *     SAM-BA User Guide</a>, the
- *     <a href="http://www.atmel.com/dyn/resources/prod_documents/doc6310.pdf">
- *     GNU-Based Software Development</a>
- *     application note or to the
- *     <a href="ftp://ftp.iar.se/WWWfiles/arm/Guides/EWARM_UserGuide.ENU.pdf">
- *     IAR EWARM User Guide</a>,
- *     depending on your chosen solution.
- *  -# On the computer, open and configure a terminal application
- *     (e.g. HyperTerminal on Microsoft Windows) with these settings:
- *    - 115200 bauds
- *    - 8 bits of data
- *    - No parity
- *    - 1 stop bit
- *    - No flow control
- *  -# Start the application.
- *  -# In the terminal window, the
- *     following text should appear (values depend on the board and chip used):
- *     \code
- *      -- LCD Example xxx --
- *      -- SAMxxxxx-xx
- *      -- Compiled: xxx xx xxxx xx:xx:xx --
- *     \endcode
- *  -# Test pattern images should be displayed on the LCD.
- *
- *  \section References
- */
-/**
- * \file
- *
- * This file contains all the specific code for the ISI example.
- */
-
-/*----------------------------------------------------------------------------
- *        Headers
- *----------------------------------------------------------------------------*/
 #include "board.h"
+#include "callback.h"
 #include "chip.h"
+#include "cpuidle.h"
+#include "irq/irq.h"
+#include "gpio/pio.h"
+#include "mm/cache.h"
+#include "mutex.h"
+#include "peripherals/pmc.h"
+#include "serial/console.h"
+#include "serial/usart.h"
+#include "serial/usartd.h"
 
 #include "display/lcdc.h"
-#include "peripherals/pmc.h"
-#include "gpio/pio.h"
-
-#include "mm/cache.h"
-#include "serial/console.h"
-#include "led/led.h"
 
 #include "lcd_draw.h"
 #include "lcd_font.h"
@@ -108,14 +25,20 @@
 #include "timer.h"
 #include "trace.h"
 
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 /*----------------------------------------------------------------------------
  *        Local definitions
  *----------------------------------------------------------------------------*/
+ 
+#define ENABLE_MBUS_UART
+#define ENABLE_DISPLAY
+#define ENABLE_KEYINPUT
+
+#ifdef ENABLE_MBUS_UART
+#define USART_ADDR FLEXUSART5
+#define USART_PINS PINS_FLEXCOM5_USART_HS_IOS1
+#endif // end of ENABLE_MBUS_UART
+
+#ifdef ENABLE_DISPLAY
 /** Size of base image buffer */
 #define SIZE_LCD_BUFFER_BASE (BOARD_LCD_WIDTH * BOARD_LCD_HEIGHT * 4)
 /** Size of Overlay 1 buffer */
@@ -130,10 +53,27 @@
 
 #define MAX_LINE_CHAR_COUNT			66
 #define MAX_FRAME_LINE_COUNT		25
+#endif // end of ENABLE_DISPLAY
 /*----------------------------------------------------------------------------
  *        Local variables
  *----------------------------------------------------------------------------*/
 
+#ifdef ENABLE_MBUS_UART
+static struct _pin pio_output = { PIO_GROUP_A, PIO_PA29, PIO_OUTPUT_0, PIO_DEFAULT };
+static const struct _pin usart_pins[] = USART_PINS;
+
+static const uint8_t test_patten[] = "abcdefghijklmnopqrstuvwxyz0123456789\n\r";
+
+static struct _usart_desc usart_desc = {
+	.addr           = USART_ADDR,
+	.baudrate       = 115200,
+	.mode           = US_MR_CHMODE_NORMAL | US_MR_PAR_NO | US_MR_CHRL_8_BIT,
+	.transfer_mode  = USARTD_MODE_POLLING,
+	.timeout        = 0, // unit: ms
+};
+#endif // end of ENABLE_MBUS_UART
+
+#ifdef ENABLE_DISPLAY
 /** LCD BASE buffer */
 CACHE_ALIGNED_DDR static uint8_t _base_buffer[BOARD_LCD_WIDTH * BOARD_LCD_HEIGHT * 3];
 
@@ -145,46 +85,32 @@ static uint8_t bBackLight = 0xF0;
 
 static uint8_t fontWidth;
 static uint8_t fontHeight;
-//static int linePos = START_POS_Y;
 
+static char gFrameBuffer[MAX_FRAME_LINE_COUNT][MAX_LINE_CHAR_COUNT+1];
+#endif // end of ENABLE_DISPLAY
+
+#ifdef ENABLE_KEYINPUT
 static struct _pin pio_input = { PIO_GROUP_D, PIO_PD18, PIO_INPUT, PIO_DEFAULT };
 static uint8_t gKeyPressed;
-
-#if 0
-static char gFrameBuffer[MAX_FRAME_LINE_COUNT][MAX_LINE_CHAR_COUNT+1] = {
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$"},
-	{"******************************************************************"},
-};
-#else
-static char gFrameBuffer[MAX_FRAME_LINE_COUNT][MAX_LINE_CHAR_COUNT+1];
-#endif
-
+#endif // end of ENABLE_KEYINPUT
 /*----------------------------------------------------------------------------
  *        Functions
  *----------------------------------------------------------------------------*/
+
+#ifdef ENABLE_KEYINPUT
+static void pio_handler(uint32_t group, uint32_t status, void* user_arg)
+{
+	/* unused */
+	(void)group;
+	(void)user_arg;
+
+	if (group == pio_input.group && (status & pio_input.mask)) {
+		gKeyPressed = 1;
+	}
+}
+#endif // end of ENABLE_KEYINPUT
+
+#ifdef ENABLE_DISPLAY
 static void fill_color(uint8_t *lcd_base)
 {
 	uint16_t v_max  = BOARD_LCD_HEIGHT;
@@ -320,14 +246,37 @@ static void screen_clean(void)
 		gFrameBuffer[i][0] = 0;
 	}
 }
+#endif // end of ENABLE_DISPLAY
 
-static void dbg_events(void)
+#ifdef ENABLE_MBUS_UART
+static int _usart_finish_tx_transfer_callback(void* arg, void* arg2)
 {
-	uint8_t key;
+	return 0;
+}
 
-	if (console_is_rx_ready()){
-		key = console_get_char();
+static void _usart_write_buffer(uint8_t *buffer, int size)
+{
+	struct _buffer tx = {
+		.data = (unsigned char*)buffer,
+		.size = size,
+		.attr = USARTD_BUF_ATTR_WRITE,
+	};
 		
+	struct _callback _cb_tx = {
+		.method = _usart_finish_tx_transfer_callback,
+		.arg = 0,
+	};
+		
+	usartd_transfer(0, &tx, &_cb_tx);
+	usartd_wait_tx_transfer(0);
+}
+
+static void _usart_irq_handler(uint32_t source, void* user_arg)
+{
+	if (usart_is_rx_ready(USART_ADDR)) {
+		uint8_t key = usart_get_char(USART_ADDR);
+		
+#ifdef ENABLE_DISPLAY
 		if( key >= 0x20 ) {
 			line_add(key);
 		} else if( key == '\n' ) {
@@ -340,37 +289,42 @@ static void dbg_events(void)
 		else {
 			printf("[%02X]", key);
 		}
+#endif // end of ENABLE_DISPLAY
+
+		printf("%c", key);
 	}
 }
-
-static void pio_handler(uint32_t group, uint32_t status, void* user_arg)
-{
-	/* unused */
-	(void)group;
-	(void)user_arg;
-
-	if (group == pio_input.group && (status & pio_input.mask)) {
-		gKeyPressed = 1;
-	}
-}
+#endif // end of ENABLE_MBUS_UART
 
 
 /*----------------------------------------------------------------------------
  *        Exported functions
  *----------------------------------------------------------------------------*/
-
-/**
- *  \brief LCD Exmple Application entry point.
- *
- *  \return Unused (ANSI-C compatibility).
- */
-extern int main(void)
+int main (void)
 {
+#ifdef ENABLE_DISPLAY
 	gKeyPressed = 0;
-	
-	/* Output example information */
-	console_example_info("LCD Example");
+#endif // end of ENABLE_DISPLAY
 
+	/* Output example information */
+	console_example_info("USART Example");
+
+#ifdef ENABLE_MBUS_UART
+	// UART pin select
+	pio_configure(&pio_output, 1);
+	pio_clear(&pio_output);
+	
+	uint32_t id = get_usart_id_from_addr(USART_ADDR);
+	pio_configure(usart_pins, ARRAY_SIZE(usart_pins));
+	usartd_configure(0, &usart_desc);
+	irq_add_handler(id, _usart_irq_handler, NULL);
+	usart_enable_it(USART_ADDR, US_IER_RXRDY);
+	irq_enable(id);
+	
+	_usart_write_buffer((uint8_t *)test_patten, sizeof(test_patten));
+#endif // end of ENABLE_MBUS_UART
+
+#ifdef ENABLE_KEYINPUT
 	/* Configure PIO for input acquisition */
 	pio_configure(&pio_input, 1);
 	pio_set_debounce_filter(100);
@@ -381,22 +335,27 @@ extern int main(void)
 	
 	pio_input.attribute |= PIO_IT_FALL_EDGE;
 	pio_enable_it(&pio_input);
-	
+#endif // end of ENABLE_DISPLAY
+
+#ifdef ENABLE_DISPLAY	
 	/* Configure LCD */
 	_LcdOn();
 
-	//screen_update();
-	//lcd_fill(COLOR_BLACK);
-	
 	printf("Width = %d, Height=%d\r\n", BOARD_LCD_WIDTH, BOARD_LCD_HEIGHT);
+#endif // end of ENABLE_DISPLAY
 
-	while(1) {
-		dbg_events();
+	while (1) {
+		cpu_idle();
+#ifdef ENABLE_KEYINPUT
 		if( gKeyPressed ) {
 			printf("key pressed\n\r");
 			gKeyPressed = 0;
-
+#ifdef ENABLE_DISPLAY
 			screen_clean();
+#endif // end of ENABLE_DISPLAY
+
 		}
+#endif //  end of ENABLE_KEYINPUT
+
 	}
 }
